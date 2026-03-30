@@ -1,0 +1,207 @@
+name: Build and Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_id:
+        description: "Deployment ID"
+        required: true
+      repo_url:
+        description: "GitHub repo URL to build"
+        required: true
+      branch:
+        description: "Branch to build"
+        required: true
+        default: "main"
+      subdomain:
+        description: "Target subdomain"
+        required: true
+      build_command:
+        description: "Build command"
+        required: true
+        default: "npm run build"
+      install_command:
+        description: "Install command (leave empty for auto-detect)"
+        required: false
+        default: ""
+      output_dir:
+        description: "Build output directory"
+        required: true
+        default: "dist"
+      callback_url:
+        description: "VPS callback URL for log streaming"
+        required: true
+      webhook_secret:
+        description: "Webhook authentication secret"
+        required: true
+
+env:
+  DEPLOYMENT_ID: ${{ github.event.inputs.deployment_id }}
+  CALLBACK_URL: ${{ github.event.inputs.callback_url }}
+  WEBHOOK_SECRET: ${{ github.event.inputs.webhook_secret }}
+  SUBDOMAIN: ${{ github.event.inputs.subdomain }}
+  OUTPUT_DIR: ${{ github.event.inputs.output_dir }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout builder scripts
+        uses: actions/checkout@v4
+
+      - name: Make log-streamer executable
+        run: chmod +x ./log-streamer.sh
+
+      - name: Clone user repository
+        run: |
+          ./log-streamer.sh "cloning" "Cloning repository ${{ github.event.inputs.repo_url }}..."
+
+          git clone --depth 1 --branch ${{ github.event.inputs.branch }} \
+            ${{ github.event.inputs.repo_url }} ./user-repo
+
+          ./log-streamer.sh "cloning" "Repository cloned successfully"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Detect package manager
+        id: detect-pm
+        working-directory: ./user-repo
+        run: |
+          if [ -f "pnpm-lock.yaml" ]; then
+            echo "manager=pnpm" >> $GITHUB_OUTPUT
+            echo "install_cmd=pnpm install --frozen-lockfile" >> $GITHUB_OUTPUT
+            npm install -g pnpm
+          elif [ -f "yarn.lock" ]; then
+            echo "manager=yarn" >> $GITHUB_OUTPUT
+            echo "install_cmd=yarn install --frozen-lockfile" >> $GITHUB_OUTPUT
+          elif [ -f "bun.lockb" ]; then
+            echo "manager=bun" >> $GITHUB_OUTPUT
+            echo "install_cmd=bun install --frozen-lockfile" >> $GITHUB_OUTPUT
+            npm install -g bun
+          else
+            echo "manager=npm" >> $GITHUB_OUTPUT
+            echo "install_cmd=npm ci" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install dependencies
+        working-directory: ./user-repo
+        run: |
+          INSTALL_CMD="${{ github.event.inputs.install_command }}"
+          if [ -z "$INSTALL_CMD" ]; then
+            INSTALL_CMD="${{ steps.detect-pm.outputs.install_cmd }}"
+          fi
+
+          cd $GITHUB_WORKSPACE
+          ./log-streamer.sh "installing" "Using ${{ steps.detect-pm.outputs.manager }} to install dependencies"
+
+          cd ./user-repo
+          $INSTALL_CMD 2>&1 | while IFS= read -r line; do
+            cd $GITHUB_WORKSPACE
+            ./log-streamer.sh "installing" "$line"
+            cd ./user-repo
+          done
+
+          cd $GITHUB_WORKSPACE
+          ./log-streamer.sh "installing" "Dependencies installed successfully"
+
+      - name: Build project
+        working-directory: ./user-repo
+        run: |
+          cd $GITHUB_WORKSPACE
+          ./log-streamer.sh "building" "Running: ${{ github.event.inputs.build_command }}"
+
+          cd ./user-repo
+          ${{ github.event.inputs.build_command }} 2>&1 | while IFS= read -r line; do
+            cd $GITHUB_WORKSPACE
+            ./log-streamer.sh "building" "$line"
+            cd ./user-repo
+          done
+
+          cd $GITHUB_WORKSPACE
+          ./log-streamer.sh "building" "Build completed successfully"
+
+      - name: Verify build output
+        working-directory: ./user-repo
+        run: |
+          if [ ! -d "${{ github.event.inputs.output_dir }}" ]; then
+            cd $GITHUB_WORKSPACE
+            ./log-streamer.sh "failed" "Build output directory '${{ github.event.inputs.output_dir }}' not found"
+            
+            # Try common alternatives
+            for dir in dist build out .next/out public; do
+              if [ -d "$dir" ]; then
+                ./log-streamer.sh "failed" "Found '$dir' directory instead. Update your project's output directory setting."
+              fi
+            done
+            
+            exit 1
+          fi
+
+          FILE_COUNT=$(find "${{ github.event.inputs.output_dir }}" -type f | wc -l)
+          TOTAL_SIZE=$(du -sh "${{ github.event.inputs.output_dir }}" | cut -f1)
+
+          cd $GITHUB_WORKSPACE
+          ./log-streamer.sh "building" "Build output: $FILE_COUNT files, $TOTAL_SIZE total"
+
+      - name: Upload to Cloudflare R2
+        working-directory: ./user-repo
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          cd $GITHUB_WORKSPACE
+          ./log-streamer.sh "uploading" "Uploading build output to R2..."
+
+          # Configure AWS CLI for R2
+          aws configure set aws_access_key_id "$R2_ACCESS_KEY_ID"
+          aws configure set aws_secret_access_key "$R2_SECRET_ACCESS_KEY"
+          aws configure set default.region auto
+
+          R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+          # Sync the build output to R2 under the subdomain prefix
+          cd ./user-repo
+          aws s3 sync "./${{ github.event.inputs.output_dir }}/" \
+            "s3://${R2_BUCKET_NAME}/${{ env.SUBDOMAIN }}/" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --delete \
+            2>&1 | while IFS= read -r line; do
+              cd $GITHUB_WORKSPACE
+              ./log-streamer.sh "uploading" "$line"
+              cd ./user-repo
+            done
+
+          cd $GITHUB_WORKSPACE
+          ./log-streamer.sh "uploading" "Upload complete"
+
+      - name: Report success
+        if: success()
+        run: |
+          START_TIME=${{ github.event.inputs.deployment_id }}
+
+          curl -s -X POST "${{ env.CALLBACK_URL }}/api/webhooks/build-status" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"secret\": \"${{ env.WEBHOOK_SECRET }}\",
+              \"deploymentId\": \"${{ env.DEPLOYMENT_ID }}\",
+              \"status\": \"ready\",
+              \"commitSha\": \"$(cd ./user-repo && git rev-parse HEAD)\"
+            }"
+
+      - name: Report failure
+        if: failure()
+        run: |
+          curl -s -X POST "${{ env.CALLBACK_URL }}/api/webhooks/build-status" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"secret\": \"${{ env.WEBHOOK_SECRET }}\",
+              \"deploymentId\": \"${{ env.DEPLOYMENT_ID }}\",
+              \"status\": \"failed\",
+              \"error\": \"Build failed. Check logs for details.\"
+            }"
